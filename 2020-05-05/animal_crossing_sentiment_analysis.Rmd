@@ -1,0 +1,253 @@
+---
+title: "Animal Crossing Sentiment Analysis"
+author: "Ashley Stewart"
+date: "07/05/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Tidy Tuesday: Animal Crossing
+
+This week, the tidy tuesday data set is based on animal crossing. There are so many possibe fun analyses to do with this data set, economic analyses of prices from the in game data, links between personalities and star signs but the data that has piqued my interest is the review data. This game flew off shelves and sold out during the time many countries were in lock down. Lets take a look at the metacritic data included in this data set. There should be quite a few people playing the game with enought time to write a review. 
+
+### The goal of our model: predict the rating for user reviews based on the sentiment. 
+
+Do the positive comments equal a higher rating from users? Are superficial positive comments follwed up by a low score but detailed criticism giving a high rating (because these people are more invested in the game/franchise?) let's find out. 
+
+First thing, get the data. 
+
+```{r load data}
+library(tidyverse) # import the tidyverse for wrangling and plotting needs
+library(tidytext) # we shall use this for the sentiment analysis
+library(rsample) # sampling
+library(textrecipes) # recipe to preprocess our data 
+library(dials) # tune the model
+library(workflows) # make a nice workflow
+library(tune)
+
+# import the user reviews using readr
+
+user_reviews <- readr::read_tsv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-05-05/user_reviews.tsv")
+```
+
+### Let's take a look at the data
+
+Once we have the data, first thing to do is take a look at our data and get our heads around what we have. We have 4 variables: grade (numeric), user_name(character), text(character) and date(date format) and 2999 reviews. 
+
+All of these have sensible data types straight from import, no need to convert these to different types. Let's take a look at our data just to see if there is anything strange. 
+
+
+#### Does the free text look sensible, at least kind of?
+
+Free text is often prone to chaos, I can ask you what colour is the sky and in free text their nothing to stop you resonding with "My dog's name is bob" but let's take a look at what we have. 
+```{r view text, echo = TRUE}
+ # lets look at a few reviews and get a feel for the data
+user_reviews %>%
+  sample_n(5) %>%
+  pull(text)
+
+```
+At least these look like senible reviews. 
+Hmmm, "... Expand" it looks like when this was scraped it only pulled the data visible on the page. Longer reviews likely have been collapsed by default on the web page and this has come through in the data. If I pulled this data myself, I'd probably go back and try to fetch this data but we shall press on since the model is the goal today. However, we should remove the Expand label from the web page as it is going to add noise to our analysis. 
+
+```{r}
+cleaned_reviews <- user_reviews %>%
+  mutate(text = str_remove(text, "Expand$")) 
+
+# make sure it worked
+cleaned_reviews %>%
+  sample_n(5) %>%
+  pull(text)
+```
+
+Much better. Although no wonder this game was sold out if you can only have one island per console. I feel for all the younger siblings being player 2 in this game from review no. 5!
+
+Let's take a look at the distirbution of scores. 
+
+```{r distribution, echo=FALSE}
+cleaned_reviews %>%
+  count(grade) %>% #calculate count of each score/grade
+  ggplot(aes(grade, n)) + # plot it
+  geom_col(fill = "blue", alpha = 0.7) + # make it blue and transparent
+  scale_x_continuous(n.breaks= 10) # scale the x axis so each grade is labelled
+```
+
+As per usual, most people who write reviews tend to have strong feelings either way. They either loved it or hated it and wanted everyone to know, less people wanted to share their neutral feelings. Given the small sample size of some of the scores (only 34 rated it a 7) we are pretty unlikely to be able to build a model to predict a specific score. We can probably 
+might need to shuffle this data into some more useful groups for modelling. We will split these up into two groups, positive and negative reviews. Given the 10 point scale, I'm going to put 7 or above as a positive review, otherwise you're a negative review. I wouldn't take someone scoring a 6/10 as a good review. 
+
+
+```{r}
+cleaned_reviews <- cleaned_reviews %>%
+  dplyr::mutate(rating = dplyr::case_when(grade >= 7 ~ "positive",
+                   grade < 7 ~ "negative"))
+```
+
+Let's take a look at our length of review. We know these will be ceiling on this where the "... Expand" was but will also help us with our sample sizes.
+
+
+```{r}
+
+words_per_review <- cleaned_reviews %>%
+  unnest_tokens(word, text) %>%
+  count(user_name, name = "total_words")
+
+words_per_review %>%
+  ggplot(aes(total_words)) +
+  geom_histogram(fill = "blue", alpha = 0.7)
+```
+
+This distribution looks a little odd in shape. It is very long tailed, might be worth a double check to see if we got everything in data collection but I can also imagine reviewers who are users not writing more than 500 words in most cases. Who has time for that?
+
+It might be interesting to look at if there is a correlation between text length and rating, but that is not the goal today. Back to our model!
+
+## Modelling time
+
+### Data preprocessing 
+First thing we want to do is set the seed and split the data into testing and training. 
+
+```{r}
+set.seed(211) # pick a seed any seed
+review_split <- rsample::initial_split(cleaned_reviews, strata = rating)
+review_train <- rsample::training(review_split)
+review_test <- rsample::testing(review_split)
+
+```
+
+We then need to remove a lot of filler. I'm going to use textrecipes package to make this easy and quick. We're going to remove stop words and set the limit to be the 400 most common words and see how we go. We'll then look at the output of this recipe before running it to make sure we've made some sensible assumptions. 
+
+```{r}
+review_recipe <- recipe(rating ~ text, data = review_train) %>%
+  step_tokenize(text) %>% # break it down to small pieces
+  step_stopwords(text) %>% # remove basic stopwords
+  step_tokenfilter(text, max_tokens = 400) %>% # most common 400 words
+  step_tfidf(text) %>% # how important are the words
+  step_normalize(all_predictors()) 
+
+review_prep <- prep(review_recipe)
+
+review_prep
+
+```
+
+We need to add in the type of model we're going with, to start with we will go with a classic regression. We'll use a lasso model as we don't yet know a lot of parameters. We're going to use the glmnet engine as a starting point as it gives us the flexibililty in the penalty parameter. tune() will be our placeholder until we're happy with the value this should be set to. 
+
+```{r}
+
+lasso_specification <- parsnip::logistic_reg(penalty = tune(), mixture = 1) %>%
+  parsnip::set_engine("glmnet")
+
+```
+
+I like being able to sense check things before and after I do them so I'm going to split this into chunks that I can shuffle if needed. I'm going to use a workflow() from the workflows package that will give me a nice read out of what will happen before I do it, this also helps if you need a friend to help troubleshoot.
+
+```{r}
+
+lasso_workflow <- workflows::workflow() %>%
+  workflows::add_recipe(review_recipe) %>%
+  workflows::add_model(lasso_specification)
+
+lasso_workflow
+
+```
+ This workflow print out is so neat and soothing. 
+ 
+### Tuning 
+
+We have to start somewhere, lets go with level 30. 
+```{r}
+lambda_grid <- dials::grid_regular(penalty(), levels = 40)
+```
+
+The way we will go about tuning, is to train many models on resampled data. 
+We will then pick the best one, survival of the fittest! (Sorry couldn't resist)
+
+```{r}
+
+set.seed(234)
+review_folds <- rsample::bootstraps(review_train, strata = rating)
+review_folds
+
+```
+
+```{r}
+
+set.seed(2020)
+lasso_grid <- tune::tune_grid(
+  lasso_workflow,
+  resamples = review_folds,
+  grid = lambda_grid,
+  metrics = yardstick::metric_set(roc_auc, ppv, npv)
+)
+
+lasso_grid %>%
+  collect_metrics()
+
+lasso_grid %>%
+  collect_metrics() %>%
+  ggplot(aes(penalty, mean, color = .metric)) +
+  geom_line(size = 1.5, show.legend = FALSE) +
+  facet_wrap(~.metric) +
+  scale_x_log10()
+
+```
+
+
+```{r}
+best_auc <- lasso_grid %>%
+  select_best("roc_auc")
+
+best_auc
+
+final_lasso <- finalize_workflow(lasso_workflow, best_auc)
+
+final_lasso
+```
+
+```{r}
+library(vip)
+
+final_lasso %>%
+  fit(review_train) %>%
+  workflows::pull_workflow_fit() %>%
+  vi(lambda = best_auc$penalty) %>%
+  group_by(Sign) %>%
+  top_n(20, wt = abs(Importance)) %>%
+  ungroup() %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = str_remove(Variable, "tfidf_text_"),
+    Variable = fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~Sign, scales = "free_y") +
+  labs(y = NULL)
+
+```
+Looking at our results here, if the review mentions family or families, the review is likely to be negative. Create, one, families, player, copies are all common to negative reviews. 
+
+Our takeaway from this is if the person who purchased the game for their family, they likely gave it a negative review. We didn't find too much amongst the positives, most words like beautiful, amazing, fanatastic etc. we probably didn't need a model to tell us they would would be common!
+
+The main insight gleaned is if the game was purchased for the family to play, you didn't like the game and were likely to give it a negative review. This would suggest that the mutliplayer has caused the negative reviews and depending on how the software was built should be patched in an update or should not be used in future. 
+
+### Model metrics
+
+
+```{r}
+review_final <- last_fit(final_lasso, review_split)
+
+review_final %>%
+  collect_metrics()
+
+```
+
+
+```{r}
+review_final %>%
+  collect_predictions() %>%
+  conf_mat(rating, .pred_class)
+```
+
